@@ -1,0 +1,410 @@
+---
+title: "AVONET EDA"
+author: "Collin Van Allen"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(mlr)
+library(DataExplorer)
+library(readxl)
+library(viridis)
+library(ggridges)
+library(parallelMap)
+library(parallel)
+library(GGally)
+library(factoextra)
+library(corrgram)
+
+
+birds <- read_csv("AVONET.csv")
+
+# Drop the non-important columns like range, latlong, and mass source
+birds_trimmed <- birds %>% filter(TrophicNiche != "NA")
+
+birds_corr <- birds_trimmed[,4:14]
+
+# Function for faster plotting
+barplotter <- function(data, target, na = FALSE, title, x, y){
+  tab <- data %>% select({{target}}) %>% group_by({{target}}) %>% tally()
+
+  if(na){
+    tab <- tab %>% filter({{target}} != "NA")
+  }
+  
+  ggplot(data = tab, aes(x = reorder({{target}}, n), y = n, fill = n)) +
+    geom_bar(stat = "identity", color = "black") + 
+    coord_flip() +
+    scale_fill_gradient(high = "#003300", low = "#CCFF99") +
+    labs(title = title, x = x, y = y) +
+    theme_classic() +
+    theme(legend.position = "none")
+}
+```
+
+# AVONET
+
+AVONET is a data set that was created to compile data on birds from multiple sources. The data set encompasses over 11,000 different species with 11 morphological traits recorded for each species. The data set contains average measurements for all the species listed. This project is only including one of the sheets located in the supplementary data set 1 and only contains roughly 10,000 of the birds from the full set. Information will also be slightly different from the main, compiled, data set since it is only from one source. An article for the data set can be found here: <https://onlinelibrary.wiley.com/doi/full/10.1111/ele.13898>. Downloads for the data set can be found in the article or at this link: <https://figshare.com/s/b990722d72a26b5bfead>.
+
+## Basic Overview on Categorical Data
+
+The main purpose of these plots on categorical data are to gauge the data set for any factors that may be of interest in the get go. These graphs also serve to determine which categorical features should be used in future graphs and tests.
+
+```{r birdstats, message=FALSE, warning=FALSE, echo=FALSE}
+barplotter(birds, PrimaryLifestyle, FALSE, "Primary Lifestyle", "Lifestyle", "Count")
+
+barplotter(birds, TrophicNiche, TRUE, "Trophic Niche", "Niche", "Count")
+
+barplotter(birds, TrophicLevel, TRUE, "Trophic Level", "Level", "Count")
+
+barplotter(birds, Habitat, TRUE, "Primary Habitat", "Habitat", "Count")
+```
+
+Overall the categorical variables provide an interesting picture for what the collection of bird species looks like. Of these, trophic niche is an interesting one to try and use for predicting certain members of a given taxa. It may pose issues if used to classify or cluster though since it has so many levels in it. Similar story for the habitats of the birds. As a whole they will all be useful in classifying other traits or predicting since they all provide important information about a given bird.
+
+## Correlation Plot
+
+Like the categorical graphs this graph serves to find any features of interest to focus on in future graphs and tests.
+
+```{r correlation, warning=FALSE, echo = FALSE}
+corrgram(birds_corr, lower.panel = panel.shade, upper.panel = panel.cor)
+```
+
+The correlation plot, like the bar graphs, provide an interesting view into the data set. Of interest I think the measurements that cover the size of the birds beak and wings will provide more information than the other measures. While the other measurements may be useful they either seems negligible in my mind or are used in other measurements, such is the case for Kipp's Distance.
+
+With most of the exploratory data analysis out of the way, there are questions and hypotheses that I want to form with the data.
+
+------------------------------------------------------------------------
+
+## Questions:
+
+1.  Using kNN; Is it possible to predict the trophic niche of a bird?
+
+2.  Using a decision tree; Can all the important features (measurements and categorical types) predict the order or family of the bird?
+
+    -   Possible follow up: Can this be used to find how closely related some birds are, or the degrees of separation on a phylogenetic tree?
+
+3.  Using PCA; Is there a way to find the best measurement features for a bird in a given trophic level/niche, habitat, or primary lifestyle?
+
+------------------------------------------------------------------------
+
+## kNN Approach
+
+With this I want to find out if it's possible to classify birds by trophic niche using only their beak size. Although not an entirely accurate way to measure since many birds share similar beak measurements but different diets. It is still interesting nonetheless to see if beak size provides a similar measurement to what multiple measurements of a given bird could provide.
+
+#### Hypothesis: Using mass, beak measurements, wing size, and habitat the trophic niche of a bird can be more accurately predicted than using just the size of the beak and primary lifestyle.
+
+Using purely kNN with repeated cross fold validation I created two models. The first model only contains measurements of the bird beak size and trophic niche for classification. The model uses tuned k value which is around 16 and goes through 20 reps of 5 fold validation. The tuning of k was done with 10 folds and 10 reps.
+
+```{r knn, echo=FALSE, warning=FALSE,message=FALSE}
+# kNN with base measures ------------------------------------------------------
+beak <- birds[,c(4,6,7,17)]
+beak <- beak %>% filter(!is.na(TrophicNiche))
+stdbeak <- as_tibble(scale(beak[,1:3]))
+stdbeak <- cbind(stdbeak, beak[,4])
+
+task <- makeClassifTask(data = stdbeak, target = "TrophicNiche")
+
+knn <- makeLearner("classif.knn", par.vals = list("k" = 16))
+
+knnModel <- train(knn, task)
+
+knnpredict <- predict(knnModel, newdata = stdbeak)
+
+kFold <- makeResampleDesc(method = "RepCV", folds = 5, reps = 20,
+                          stratify = TRUE)
+kFoldCV <- resample(learner = knn, task = task,
+                    resampling = kFold, measures = list(mmce, acc))
+
+calculateConfusionMatrix(kFoldCV$pred, relative = TRUE)
+
+knnParamSpace <- makeParamSet(makeDiscreteParam("k", values = 1:30))
+
+gridSearch <- makeTuneControlGrid()
+
+cvForTuning <- makeResampleDesc("RepCV", folds = 10, reps = 10)
+
+tunedK <- tuneParams("classif.knn", task = task,
+                     resampling = cvForTuning,
+                     par.set = knnParamSpace, control = gridSearch)
+
+
+knnTuningData <- generateHyperParsEffectData(tunedK)
+
+plotHyperParsEffect(knnTuningData, x = "k", y = "mmce.test.mean",
+                    plot.type = "line") + theme_bw()
+
+hyperpar1.compiled <- tibble(k = knnTuningData$data$k, mmce = knnTuningData$data$mmce.test.mean, ID = "Beak")
+```
+
+Overall the model did fairly well at classifying the trophic niche of the birds, but it's far from perfect and could be improved. As the model stands now multiple niches are incorrectly identified at rates above 50%.
+
+In the second model I attempted to improve the model by including the wing length (length from carpal joint to wingtip), secondary (length from carpal joint to outermost secondary feather), and habitat. The idea is that when beak measurements are not enough, a higher accuracy should be achievable if the model can learn the size of the wing and habitat in which the bird lives.
+
+In this model almost all the parameters and cross fold validation are the same bar the k for this model. After tuning the model it was found that the optimal value for k is around 8.
+
+```{r knnpt2, echo=FALSE, message=FALSE,warning=FALSE}
+#kNN with extra measures-----------------------------------------------------
+
+bird.knn <- birds[,c(4,6,7,9,11,15,17)]
+
+bird.knn.std <- as_tibble(scale(bird.knn[,c(1:5)]))
+bird.knn.std <- cbind(bird.knn.std, bird.knn[,6:7])
+bird.knn.std <- bird.knn.std %>% filter(!is.na(TrophicNiche) & !is.na(Habitat))
+
+bird.knn.std <- transform(bird.knn.std,
+                             Habitat = as.numeric(as.factor(Habitat))) 
+
+task2 <- makeClassifTask(data = bird.knn.std, target = "TrophicNiche")
+
+knn2 <- makeLearner("classif.knn", par.vals = list("k" = 8))
+
+knnModel2 <- train(knn2, task2)
+
+knnpredict2 <- predict(knnModel2, newdata = bird.knn.std)
+
+kFoldCV2 <- resample(learner = knn2, task = task2,
+                    resampling = kFold, measures = list(mmce, acc))
+
+calculateConfusionMatrix(kFoldCV2$pred, relative = TRUE)
+
+tunedK2 <- tuneParams("classif.knn", task = task2,
+                     resampling = cvForTuning,
+                     par.set = knnParamSpace, control = gridSearch)
+
+knnTuningData2 <- generateHyperParsEffectData(tunedK2)
+
+plotHyperParsEffect(knnTuningData2, x = "k", y = "mmce.test.mean",
+                    plot.type = "line") + theme_bw()
+
+hyperpar2.compiled <- tibble(k = knnTuningData2$data$k, mmce = knnTuningData2$data$mmce.test.mean, ID = "Beak + Extra")
+```
+
+The results of the model with added features improved the classification power of the model overall. There are less classifications that are above 50% and the over error of the model is much lower than the first model.
+
+------------------------------------------------------------------------
+
+### kNN Results
+
+```{r knnresults, echo=FALSE,warning=FALSE}
+# Plot Results  -------------------------------------------------------------
+hyperpar.compiled <- rbind(hyperpar1.compiled,hyperpar2.compiled)
+
+yint.h1 <- round(min(hyperpar1.compiled$mmce),2)
+yint.h2 <- round(min(hyperpar2.compiled$mmce),2)
+
+hyperpar.compiled %>% ggplot(aes(x = k, y = mmce, group=ID, color = ID, shape = ID)) +
+  geom_point() + geom_line() +
+  geom_hline(yintercept=min(hyperpar1.compiled$mmce), linetype="dashed", color = "black") +
+  geom_text(aes(0,yint.h1,label = yint.h1, vjust = -1),color = "black") +
+  geom_hline(yintercept=min(hyperpar2.compiled$mmce), linetype="dashed", color = "black") +
+  geom_text(aes(0,yint.h2,label = yint.h2, vjust = -1), color = "black") +
+  ggtitle("Hyper Parameter Tuning") +
+  theme_bw()
+```
+
+By taking both graphs of the tuned hyperparamter we can see that the second model always out performs the first model and is overall much better at predicting the niche of the birds. In summary the hypothesis that I proposed turned out to be correct and the model with more measurements than the ones that measure the beak is better.
+
+## Decision Tree Model
+
+For this model I wanted to try and classify the taxonomic family of given birds. I wanted to try a decision tree for this model because can handle multiple classes, and in a sense, it resembles the structure of a phylogenetic tree. With the amount of measurements and birds, it may struggle to classify birds.
+
+#### Hypothesis: Using purely measurements on the bird such as beak size, wing size, and tarsus length, the rate of misclassification will be lower for a model containing all measurements and the habitat and lifestyle of the bird versus just the base measurements of the bird.
+
+```{r tree, message=FALSE, echo=FALSE,warning=FALSE}
+bird.family <- as_tibble(birds[,c(2,4,6:9,11,14)])
+
+tree.task <- makeClassifTask(data = bird.family, target = "Family3")
+
+tree.learner <- makeLearner("classif.rpart")
+
+tree.model <- train(tree.learner, tree.task)
+
+tree.predict <- predict(tree.model, newdata = bird.family)
+
+treeParamSpace <- makeParamSet(
+  makeIntegerParam("minsplit", lower = 5, upper = 20),
+  makeIntegerParam("minbucket", lower = 3, upper = 10),
+  makeNumericParam("cp", lower = 0.01, upper = 0.1),
+  makeIntegerParam("maxdepth", lower = 3, upper = 10))
+
+tree.randSearch <- makeTuneControlRandom(maxit = 200)
+tree.cvForTuning <- makeResampleDesc("CV", iters = 5)
+
+parallelStartSocket(cpus = detectCores())
+
+tunedTreePars <- tuneParams(tree.learner, task = tree.task,
+                            resampling = tree.cvForTuning,
+                            par.set = treeParamSpace,
+                            control = tree.randSearch)
+
+parallelStop()
+
+tunedTreePars
+
+tunedTree <- setHyperPars(tree.learner, par.vals = tunedTreePars$x)
+tunedTreeModel <- train(tunedTree, tree.task)
+
+outer.tree <- makeResampleDesc("CV", iters = 25)
+treeWrapper <- makeTuneWrapper("classif.rpart", resampling = tree.cvForTuning,
+                               par.set = treeParamSpace,
+                               control = tree.randSearch)
+parallelStartSocket(cpus = detectCores())
+tree.cvWithTuning <- resample(treeWrapper, tree.task, resampling = outer.tree)
+parallelStop()
+
+tree.cvWithTuning
+```
+
+Given the nature of decision trees and the large number of families that it needs to account for, there is less of a visual aspect to what the tests are running. With that being said, it still produces good information. We can see that just using the measurements of a bird are not enough to classify the family. It is actually quite poor at classifying the family without knowing the habitat or diet of the bird.
+
+```{r tree2, message=FALSE, echo=FALSE,warning=FALSE}
+bird.familyex <- as_tibble(birds[,c(2,4,6:9,11,14:16,18)])
+
+bird.familyex <- transform(bird.familyex,
+                             Habitat = as.numeric(as.factor(Habitat)),
+                           TrophicLevel = as.numeric(as.factor(TrophicLevel)),
+                           PrimaryLifestyle = as.numeric(as.factor(PrimaryLifestyle))) 
+
+tree.task2 <- makeClassifTask(data = bird.familyex, target = "Family3")
+
+tree.learner2 <- makeLearner("classif.rpart")
+
+tree.model2 <- train(tree.learner2, tree.task2)
+
+tree.predict2 <- predict(tree.model2, newdata = bird.familyex)
+
+treeParamSpace2 <- makeParamSet(
+  makeIntegerParam("minsplit", lower = 5, upper = 20),
+  makeIntegerParam("minbucket", lower = 3, upper = 10),
+  makeNumericParam("cp", lower = 0.01, upper = 0.1),
+  makeIntegerParam("maxdepth", lower = 3, upper = 10))
+
+tree.randSearch2 <- makeTuneControlRandom(maxit = 200)
+tree.cvForTuning2 <- makeResampleDesc("CV", iters = 5)
+
+parallelStartSocket(cpus = detectCores())
+
+tunedTreePars2 <- tuneParams(tree.learner2, task = tree.task2,
+                            resampling = tree.cvForTuning2,
+                            par.set = treeParamSpace2,
+                            control = tree.randSearch2)
+
+parallelStop()
+
+tunedTreePars2
+
+tunedTree2 <- setHyperPars(tree.learner2, par.vals = tunedTreePars2$x)
+tunedTreeMode2l <- train(tunedTree2, tree.task2)
+
+outer.tree2 <- makeResampleDesc("CV", iters = 25)
+treeWrapper2 <- makeTuneWrapper("classif.rpart", resampling = tree.cvForTuning2,
+                               par.set = treeParamSpace2,
+                               control = tree.randSearch2)
+parallelStartSocket(cpus = detectCores())
+tree.cvWithTuning2 <- resample(treeWrapper2, tree.task2, resampling = outer.tree2)
+parallelStop()
+
+tree.cvWithTuning2
+```
+
+The second model with more variables did just barely worse than the original model. Overall both models did a very poor job at classifying the family of the bird. My hypothesis for this set of models was wrong as the base measurements did better than the extended model. If I had to choose a better model I would probably choose something like a support vector machine. With that being said, due to the size of the data set and variables I could foresee problems with running the model since it is so intensive with its resources.
+
+------------------------------------------------------------------------
+
+## Using PCA
+
+For my final question I wanted to look at the the measurements for the birds and how they relate to some of the categorical data. Ideally I would have done this at the start to create better models in the kNN and decision tree models, but I wanted to approach those blindly. With these PCA models I can get a better understanding of why certain models might not have worked as well and have better information for future tests and models.
+
+#### Hypothesis: When looking at the PCA models, the first 2 components of each model will do better at explaining the variance in both trophic niche and taxonomic family of the birds than the kNN and decision tree did. While the PCA models and classification algorithms are not easily comparable, the PCA models will provide a better picture of the measurements that go in to predicting the trophic niche and family.
+
+In the first model I wanted to put all the measurements into the PCA model and see how they contribute to the trophic niche of the birds. When I looked at these in the kNN model it was found that all the measurements, with the inclusion of habitat, produced mmce values below 30%.
+
+```{r pca_tn, message=FALSE,echo=FALSE,warning=FALSE}
+bird.pca1 <- as_tibble(birds[,c(4,6:9,11,17)])
+
+#perform PCA using the function prcomp()
+pca1 <- select(bird.pca1, -TrophicNiche) %>%
+  prcomp(center = TRUE, scale = TRUE)
+
+print("Here are the eigenvectors for the 6 PCS")
+pca1$rotation
+print("And here are the square roots of the eigenvalues")
+pca1$sdev
+
+#using map_dfc() from purrr to rapidly apply multiplication of each PC's eigenvector by sqrt(eigenvalue)
+print("These are the loadings")
+map_dfc(1:6, ~pca1$rotation[, .] * pca1$sdev[.])
+
+pcaDat1 <- get_pca(pca1)
+
+fviz_pca_biplot(pca1, label = "var")
+
+fviz_pca_var(pca1)
+
+fviz_screeplot(pca1, addlabels = TRUE, choice = "eigenvalue")
+
+fviz_screeplot(pca1, addlabels = TRUE, choice = "variance")
+
+BirdPca <- bird.pca1 %>%
+  mutate(PC1 = pca1$x[, 1], PC2 = pca1$x[, 2])
+
+ggplot(BirdPca, aes(PC1, PC2, col = TrophicNiche)) +
+  geom_point() +
+  theme(legend.position = "none")
+```
+
+When looking at the first PCA focused on trophic level we can see that almost 90% of the variance in trophic level can be explained by the first two components. This is surprising to see since the mmce values in the kNN model suggest that these variables do not do as well when classifying. It is also interesting to see that the beak measurements provide more of a negative effect towards the classification of trophic niche than the wing and tarsus measurements.
+
+In the next PCA model I wanted to see what variables do the best job at explaining the taxonomic family of the birds. The decision tree that used the same measurements did a very poor job at classifying and the goal is to see if the PCA model provides any insights.
+
+```{r pca_f, message=FALSE,echo=FALSE,warning=FALSE}
+bird.pca2 <- as_tibble(birds[,c(2,4,6:9,11,14)])
+
+#perform PCA using the function prcomp()
+pca2 <- select(bird.pca2, -Family3) %>%
+  prcomp(center = TRUE, scale = TRUE)
+
+print("Here are the eigenvectors for the 6 PCS")
+pca2$rotation
+print("And here are the square roots of the eigenvalues")
+pca2$sdev
+
+#using map_dfc() from purrr to rapidly apply multiplication of each PC's eigenvector by sqrt(eigenvalue)
+print("These are the loadings")
+map_dfc(1:6, ~pca2$rotation[, .] * pca2$sdev[.])
+
+pcaDat2 <- get_pca(pca2)
+
+fviz_pca_biplot(pca2, label = "var")
+
+fviz_pca_var(pca2)
+
+fviz_screeplot(pca2, addlabels = TRUE, choice = "eigenvalue")
+
+fviz_screeplot(pca2, addlabels = TRUE, choice = "variance")
+
+BirdPca2 <- bird.pca2 %>%
+  mutate(PC1 = pca2$x[, 1], PC2 = pca2$x[, 2])
+
+ggplot(BirdPca2, aes(PC1, PC2, col = Family3)) +
+  geom_point() +
+  theme(legend.position = "none")
+```
+
+Similarly with this PCA model, the overall variance explained by the first two components is very high, with this model being just a bit higher than 80%. This is interesting to see because the decision tree that tested these values produced a very bad model. In future models I would like to test to see if there is a classification algorithm that can better classify the family of the bird. With this model, like the last PCA model, the beak measurements do not do as good of a job and the other measurements provided do better.
+
+In summary the hypothesis I made was correct, the models showed that the trophic niche and family of the birds were better explained by the PCA models than when used in a classification algorithm. Like mentioned earlier, this is not a good comparison since the models cover completely different things and PCA is for dimensionality reduction.
+
+------------------------------------------------------------------------
+
+## Summary
+
+In this report I mainly covered the trophic niche and the family of the birds since they seemed like the more interesting one of the categorical variables. When using kNN the model did okay at classifying the niche of the bird, and did better when the habitat and wing measurements were included in the model. For the decision tree model, both models did poorly at classifying the taxonomic family of the tree. Finally, in the PCA models it was found that the measurements account for 80% or more of the variance when using the first two components. The PCA models provide some insight as to how important the measurements were and how the classification models were not suitable.
+
+In future studies using this data set I would want to look at more unsupervised learning methods for predicting the niche and family since the supervised methods are either too limited in what they can do, or cannot handle large data. I would especially be interested to see how an artificial neural network could handle the classifications of these metrics.
